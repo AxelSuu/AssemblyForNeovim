@@ -14,14 +14,21 @@ local function find_up(from, name)
 	return vim.fs.find(name, { path = from, upward = true, type = "file" })[1]
 end
 
-local function db_entry(path)
-	local dirs = { find_up(vim.fs.dirname(path), "compile_commands.json") }
-	local root = vim.fs.root(path, { ".git", "CMakeLists.txt", "Makefile", "meson.build" })
-	if root then
+-- compile_commands.json next to the file or in a build dir of any parent; the nearest
+-- CMakeLists.txt may belong to a component (ESP-IDF main/), not the project
+local function db_candidates(path)
+	local dirs = {}
+	for dir in vim.fs.parents(path) do
+		dirs[#dirs + 1] = dir .. "/compile_commands.json"
 		for _, sub in ipairs({ "build", "out", "builddir" }) do
-			dirs[#dirs + 1] = root .. "/" .. sub .. "/compile_commands.json"
+			dirs[#dirs + 1] = dir .. "/" .. sub .. "/compile_commands.json"
 		end
 	end
+	return dirs
+end
+
+local function db_entry(path)
+	local dirs = db_candidates(path)
 
 	local want = vim.fs.normalize(path)
 	for _, db in ipairs(dirs) do
@@ -40,6 +47,52 @@ local function db_entry(path)
 			end
 		end
 	end
+end
+
+-- Split a compile command like a POSIX shell, so escaped quotes in -D values survive
+local function shell_split(cmd)
+	local args, cur, quote, started = {}, {}, nil, false
+	local i = 1
+	while i <= #cmd do
+		local c = cmd:sub(i, i)
+		if quote == "'" then
+			if c == "'" then
+				quote = nil
+			else
+				cur[#cur + 1] = c
+			end
+		elseif quote == '"' then
+			local nxt = cmd:sub(i + 1, i + 1)
+			if c == '"' then
+				quote = nil
+			elseif c == "\\" and nxt:match('[\\"$`]') then
+				cur[#cur + 1] = nxt
+				i = i + 1
+			else
+				cur[#cur + 1] = c
+			end
+		elseif c == "\\" and i < #cmd then
+			cur[#cur + 1] = cmd:sub(i + 1, i + 1)
+			started = true
+			i = i + 1
+		elseif c == "'" or c == '"' then
+			quote = c
+			started = true
+		elseif c:match("%s") then
+			if started then
+				args[#args + 1] = table.concat(cur)
+				cur, started = {}, false
+			end
+		else
+			cur[#cur + 1] = c
+			started = true
+		end
+		i = i + 1
+	end
+	if started then
+		args[#args + 1] = table.concat(cur)
+	end
+	return args
 end
 
 local DROP_PAIR = { ["-o"] = true, ["-MF"] = true, ["-MT"] = true, ["-MQ"] = true }
@@ -62,7 +115,7 @@ end
 local function cc_base(path, ft)
 	local e = db_entry(path)
 	if e then
-		return strip(e.arguments or vim.split(e.command or "", "%s+", { trimempty = true })), e.directory
+		return strip(e.arguments or shell_split(e.command or "")), e.directory
 	end
 	return {
 		ft == "cpp" and "c++" or "cc",
@@ -113,6 +166,11 @@ local function build(path, ft, level)
 
 	local argv, cwd = cc_base(path, ft)
 	vim.list_extend(argv, { "-S", "-g", "-O" .. level })
+	-- Cross GCCs may not use .loc by default; -dA adds file:line comments as a fallback
+	local compiler = vim.fs.basename(argv[1] or "")
+	if compiler:match("gcc$") or compiler:match("g%+%+$") then
+		vim.list_extend(argv, { "-gas-loc-support", "-dA" })
+	end
 	if targets_x86({ argv[1], "-dumpmachine" }, cwd) then
 		argv[#argv + 1] = "-masm=intel"
 	end
@@ -156,15 +214,31 @@ local function extract(lines, path, l1, l2, src)
 	local ids = our_file_ids(lines, path)
 	local items, inside, fn, prev = {}, false, nil, nil
 
+	-- Some GCC builds (ESP-IDF RISC-V) emit no .loc; with -dA they annotate "# file.c:line:col"
+	local has_loc, base = false, vim.fs.basename(path)
+	for _, l in ipairs(lines) do
+		if l:match("^%s*%.loc%s") then
+			has_loc = true
+			break
+		end
+	end
+
 	for _, l in ipairs(lines) do
 		local fno, lno = l:match("^%s*%.loc%s+(%d+)%s+(%d+)")
-		if fno then
-			lno = tonumber(lno)
-			inside = ids[tonumber(fno)] and lno >= l1 and lno <= l2
+		local cfile, cline
+		if not has_loc then
+			cfile, cline = l:match("^%s*#%s+(%S+):(%d+):%d+%s*$")
+		end
+		if fno or cfile then
+			lno = tonumber(lno or cline)
+			local ours = (fno and ids[tonumber(fno)]) or (cfile and vim.fs.basename(cfile) == base)
+			inside = ours and lno >= l1 and lno <= l2
 			if inside and lno ~= prev then
 				items[#items + 1] = { kind = "src", line = lno, fn = fn }
 				prev = lno
 			end
+		elseif l:match("^%s*#") then
+			-- assembler comment
 		else
 			local name = l:match('^"?([%w_$.@][%w_$.@]*)"?:')
 			if name then
